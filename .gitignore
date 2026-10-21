@@ -1,0 +1,66 @@
+# Composer
+/vendor/
+composer.phar
+composer.lock
+
+# PHPUnit
+/.phpunit.cache/
+/.phpunit.result.cache
+phpunit.xml.bak
+
+# IDE / editors
+/.idea/
+/.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temp
+*.log
+/tmp/
+/build/
+/coverage/
+/clover.xml
+/coverage.xml
+/.phpunit.cache/test-results
+
+# Local config and secrets (never commit credentials)
+/.env
+/.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+!tests/Fixtures/*.pem
+!tests/Fixtures/*.key
+known_hosts
+.ssh/
+
+# PHPStan / Psalm / Rector caches
+/.phpstan.cache/
+/.psalm/
+/.rector/
+
+# PHP CS Fixer
+/.php-cs-fixer.cache
+/.php-cs-fixer.php
+.php-cs-fixer.dist.php.bak
+
+# Node (if any tooling is added later)
+/node_modules/
+npm-debug.log*
+
+# Misc
+*.bak
+*.orig
+*.rej
+.cai*
+*.txt
