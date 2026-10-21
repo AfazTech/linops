@@ -7,9 +7,38 @@ declare(strict_types=1);
  *
  * Reads JSON lines from STDIN, executes SSH commands and SFTP operations
  * with the blocking phpseclib transport, and writes JSON lines to STDOUT.
+ *
+ * The autoloader path is resolved by walking up from __DIR__ until a
+ * vendor/autoload.php is found. This works both for a standalone checkout
+ * (src/Transport/Worker/worker.php) and when the package is installed as a
+ * Composer dependency (vendor/<vendor>/<package>/src/Transport/Worker/...).
  */
 
-require __DIR__ . '/../../../vendor/autoload.php';
+$findAutoload = static function (string $startDir): ?string {
+    $dir = $startDir;
+    for ($i = 0; $i < 12; $i++) {
+        $candidate = $dir . '/vendor/autoload.php';
+        if (is_file($candidate)) {
+            return $candidate;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) {
+            return null;
+        }
+        $dir = $parent;
+    }
+    return null;
+};
+
+$autoload = getenv('LINOPS_AUTOLOAD') ?: '';
+if ($autoload === '' || !is_file($autoload)) {
+    $autoload = $findAutoload(__DIR__);
+}
+if ($autoload === null) {
+    fwrite(STDERR, "LinOps worker: unable to locate vendor/autoload.php.\n");
+    exit(1);
+}
+require $autoload;
 
 use AfazTech\LinOps\ServerConfig;
 use AfazTech\LinOps\Transport\PhpseclibTransport;

@@ -18,10 +18,38 @@ declare(strict_types=1);
  * payload sets allowFallback=true, the command is retried via SSH2::exec()
  * on a fresh connection.
  *
+ * The autoloader path is resolved by walking up from __DIR__ until a
+ * vendor/autoload.php is found. This works both for a standalone checkout
+ * and when the package is installed as a Composer dependency.
+ *
  * Protocol: one JSON object per line on stdin/stdout.
  */
 
-require __DIR__ . '/../../../vendor/autoload.php';
+$findAutoload = static function (string $startDir): ?string {
+    $dir = $startDir;
+    for ($i = 0; $i < 12; $i++) {
+        $candidate = $dir . '/vendor/autoload.php';
+        if (is_file($candidate)) {
+            return $candidate;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) {
+            return null;
+        }
+        $dir = $parent;
+    }
+    return null;
+};
+
+$autoload = getenv('LINOPS_AUTOLOAD') ?: '';
+if ($autoload === '' || !is_file($autoload)) {
+    $autoload = $findAutoload(__DIR__);
+}
+if ($autoload === null) {
+    fwrite(STDERR, "LinOps worker: unable to locate vendor/autoload.php.\n");
+    exit(1);
+}
+require $autoload;
 
 use AfazTech\LinOps\ServerConfig;
 use AfazTech\LinOps\Transport\SshConnector;
@@ -224,15 +252,11 @@ function streamViaPty(
             $emitted = $safeLen;
         }
 
-        // Trim already-emitted bytes so $pending stays bounded.
         if ($emitted > 0) {
             $pending = substr($pending, $emitted);
             $emitted = 0;
         }
 
-        // Idle flush: if output has stalled and the tail is not a partial
-        // marker, emit the remaining bytes so interactive prompts reach the
-        // caller without waiting for the marker.
         if ($pending !== '' && (microtime(true) - $lastDataAt) >= $flushAfter) {
             $hasPrefix = endsWithMarkerPrefix($pending, $marker);
 

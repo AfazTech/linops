@@ -6,19 +6,42 @@ namespace AfazTech\LinOps\Transport;
 
 use AfazTech\LinOps\Exception\WorkerException;
 use Amp\Cancellation;
+use Amp\Future;
 use Amp\Process\Process;
+use Amp\TimeoutCancellation;
+use function Amp\async;
 
 /**
  * @internal
  */
 final class WorkerHandle
 {
+    private const MAX_STDERR_BUFFER = 64 * 1024;
+    private const STDERR_DRAIN_TIMEOUT = 0.2;
+
     private bool $invalid = false;
     private string $stdoutBuffer = '';
+    private string $stderrBuffer = '';
+
+    private readonly Future $stderrDrain;
 
     public function __construct(
         public readonly Process $process,
     ) {
+        // Continuously drain stderr. Without this, a PHP fatal error in the
+        // worker (written to stderr) deadlocks the pipe, and the caller only
+        // sees "Worker closed stdout unexpectedly" with no details.
+        $this->stderrDrain = async(function (): void {
+            try {
+                while (($chunk = $this->process->getStderr()->read()) !== null) {
+                    if (strlen($this->stderrBuffer) < self::MAX_STDERR_BUFFER) {
+                        $this->stderrBuffer .= $chunk;
+                    }
+                }
+            } catch (\Throwable) {
+                // Stream closed or process killed; nothing more to capture.
+            }
+        });
     }
 
     public function isAlive(): bool
@@ -38,7 +61,9 @@ final class WorkerHandle
      * Read one newline-terminated line from the worker's stdout.
      *
      * On cancellation, the handle is invalidated and the process is killed
-     * so a subsequent request cannot read a stale response.
+     * so a subsequent request cannot read a stale response. If the worker
+     * closes stdout, we wait briefly for the stderr drain to finish and
+     * include its contents in the exception message.
      */
     public function readLine(?Cancellation $cancellation = null): string
     {
@@ -59,7 +84,8 @@ final class WorkerHandle
 
             if ($chunk === null) {
                 $this->invalid = true;
-                throw new WorkerException('Worker closed stdout unexpectedly.');
+                $this->flushStderr();
+                throw new WorkerException($this->buildClosedMessage());
             }
 
             $this->stdoutBuffer .= $chunk;
@@ -98,6 +124,7 @@ final class WorkerHandle
         }
 
         $this->invalid = true;
+        $this->flushStderr();
     }
 
     public function __destruct()
@@ -109,5 +136,32 @@ final class WorkerHandle
         } catch (\Throwable) {
             // Ignore.
         }
+    }
+
+    /**
+     * Wait briefly for the stderr drain to finish so we can include the
+     * worker's own error output in the exception message.
+     */
+    private function flushStderr(): void
+    {
+        if ($this->stderrDrain->isComplete()) {
+            return;
+        }
+
+        try {
+            $this->stderrDrain->await(new TimeoutCancellation(self::STDERR_DRAIN_TIMEOUT));
+        } catch (\Throwable) {
+            // Timeout or cancellation; use whatever we captured.
+        }
+    }
+
+    private function buildClosedMessage(): string
+    {
+        $stderr = trim($this->stderrBuffer);
+        if ($stderr === '') {
+            return 'Worker closed stdout unexpectedly.';
+        }
+
+        return 'Worker closed stdout unexpectedly. Worker stderr: ' . $stderr;
     }
 }
