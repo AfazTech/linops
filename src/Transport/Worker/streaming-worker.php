@@ -3,16 +3,22 @@
 declare(strict_types=1);
 
 /**
- * Streaming worker for SSH commands and interactive shells.
+ * Streaming worker for SSH commands, interactive shells, and PTY sessions.
  *
  * Modes:
  *   exec  - wrap the command, emit chunk messages, exit on marker.
  *   shell - open a PTY shell and relay stdin/stdout until close.
  *
- * PTY output is emitted with a small tail buffer so the completion marker
- * (__LINOPS_STREAM_xxx:N) is never split across chunk boundaries. If the
- * command blocks waiting for input, the tail is flushed after a short
- * idle window so interactive prompts reach the caller immediately.
+ * PTY output is emitted with a small tail buffer in exec mode so the
+ * completion marker (__LINOPS_STREAM_xxx:N) is never split across chunk
+ * boundaries. If the command blocks waiting for input, the tail is flushed
+ * after a short idle window so interactive prompts reach the caller
+ * immediately.
+ *
+ * Binary safety: if a chunk contains bytes that are not valid UTF-8 (e.g.
+ * `cat /dev/urandom` or a binary editor), json_encode() fails. In that case
+ * the chunk is re-emitted as base64 with encoding="base64" and data_b64.
+ * The parent (SshStreamingRunner / PtySession) transparently decodes it.
  *
  * If the server refuses the PTY shell channel during exec mode and the
  * payload sets allowFallback=true, the command is retried via SSH2::exec()
@@ -73,8 +79,41 @@ if ($stdin === false || $stdout === false) {
  */
 function emit($stdout, array $data): void
 {
-    fwrite($stdout, json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
-    fflush($stdout);
+    $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+    if ($json === false && isset($data['data']) && is_string($data['data'])) {
+        // Fall back to base64 encoding when the payload is not valid UTF-8
+        // (e.g. binary PTY output from `cat /dev/urandom`).
+        $data['data_b64'] = base64_encode($data['data']);
+        unset($data['data']);
+        $data['encoding'] = 'base64';
+        $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+
+    if ($json === false) {
+        $json = json_encode(['type' => 'error', 'message' => 'Encoding failure in worker.']);
+    }
+
+    if ($json !== false) {
+        fwrite($stdout, $json . "\n");
+        fflush($stdout);
+    }
+}
+
+/**
+ * Decode an "input" message that may carry plain text or base64-encoded
+ * binary data. Returns the raw bytes to write to the SSH channel.
+ *
+ * @param array<string, mixed> $msg
+ */
+function decodeInput(array $msg): string
+{
+    if (($msg['encoding'] ?? '') === 'base64' && isset($msg['data_b64']) && is_string($msg['data_b64'])) {
+        $decoded = base64_decode($msg['data_b64'], true);
+        return $decoded !== false ? $decoded : '';
+    }
+
+    return (string) ($msg['data'] ?? '');
 }
 
 /**
@@ -124,8 +163,13 @@ function handleShell($stdout, $stdin, array $payload): never
         exit(1);
     }
 
-    $ssh->setTerminal('xterm');
-    $ssh->setWindowSize(80, 24);
+    $pty = is_array($payload['pty'] ?? null) ? $payload['pty'] : [];
+    $term = (string) ($pty['term'] ?? 'xterm-256color');
+    $cols = max(1, (int) ($pty['cols'] ?? 80));
+    $rows = max(1, (int) ($pty['rows'] ?? 24));
+
+    $ssh->setTerminal($term);
+    $ssh->setWindowSize($cols, $rows);
     $ssh->enablePTY();
     $ssh->setTimeout(10.0);
 
@@ -142,18 +186,27 @@ function handleShell($stdout, $stdin, array $payload): never
 
     $ssh->setTimeout(0.1);
 
-    $timeout = (float) ($payload['timeout'] ?? 3600.0);
+    $timeout = (float) ($payload['timeout'] ?? 0.0);
+    $checkTimeout = $timeout > 0;
     $startedAt = microtime(true);
+    $exitCode = 0;
 
     while (true) {
-        if (microtime(true) - $startedAt > max(1.0, $timeout)) {
+        if ($checkTimeout && microtime(true) - $startedAt > $timeout) {
             emit($stdout, ['type' => 'chunk', 'stream' => 'stderr', 'data' => "\n[linops] shell session timed out\n"]);
+            $exitCode = -1;
             break;
         }
 
         try {
             $chunk = $ssh->read('', SSH2::READ_SIMPLE);
         } catch (\Throwable) {
+            $exitCode = -1;
+            break;
+        }
+
+        if ($chunk === false) {
+            // Shell exited naturally (channel closed).
             break;
         }
 
@@ -167,7 +220,29 @@ function handleShell($stdout, $stdin, array $payload): never
             if (is_array($msg)) {
                 $mtype = $msg['type'] ?? '';
                 if ($mtype === 'input') {
-                    $ssh->write((string) ($msg['data'] ?? ''));
+                    $data = decodeInput($msg);
+                    if ($data !== '') {
+                        try {
+                            $ssh->write($data);
+                        } catch (\Throwable) {
+                            $exitCode = -1;
+                            break;
+                        }
+                    }
+                } elseif ($mtype === 'resize') {
+                    $c = (int) ($msg['cols'] ?? 0);
+                    $r = (int) ($msg['rows'] ?? 0);
+                    if ($c > 0 && $r > 0) {
+                        try {
+                            if (method_exists($ssh, 'windowResize')) {
+                                $ssh->windowResize($c, $r);
+                            } else {
+                                $ssh->setWindowSize($c, $r);
+                            }
+                        } catch (\Throwable) {
+                            // Best-effort; phpseclib may lack runtime resize.
+                        }
+                    }
                 } elseif ($mtype === 'close') {
                     break;
                 }
@@ -182,7 +257,7 @@ function handleShell($stdout, $stdin, array $payload): never
     } catch (\Throwable) {
     }
 
-    emit($stdout, ['type' => 'exit', 'code' => 0]);
+    emit($stdout, ['type' => 'exit', 'code' => $exitCode]);
     exit(0);
 }
 
@@ -283,7 +358,10 @@ function streamViaPty(
             if (is_array($msg)) {
                 $type = $msg['type'] ?? '';
                 if ($type === 'input') {
-                    $ssh->write((string) ($msg['data'] ?? ''));
+                    $data = decodeInput($msg);
+                    if ($data !== '') {
+                        $ssh->write($data);
+                    }
                 } elseif ($type === 'close') {
                     return 130;
                 }

@@ -6,6 +6,7 @@ namespace AfazTech\LinOps\Streaming;
 
 use AfazTech\LinOps\Exception\WorkerException;
 use AfazTech\LinOps\ServerConfig;
+use Amp\Cancellation;
 use Amp\Process\Process;
 use function Amp\async;
 use function Amp\delay;
@@ -14,16 +15,22 @@ use function Amp\delay;
  * Streams a remote command or shell over SSH by spawning a dedicated worker
  * process that uses phpseclib in PTY mode.
  *
- * Protocol (parent ↔ worker), one JSON object per line:
- *   parent → worker: {"type":"exec","config":{...},"command":"...","timeout":N,"allowFallback":bool}
- *   parent → worker: {"type":"shell","config":{...},"timeout":N}
- *   parent → worker: {"type":"input","data":"y\n"}
- *   parent → worker: {"type":"close"}
- *   worker → parent: {"type":"chunk","stream":"stdout","data":"..."}
- *   worker → parent: {"type":"exit","code":0}
- *   worker → parent: {"type":"error","message":"..."}
+ * Also implements PtySessionRunnerInterface to open a live interactive PTY
+ * session as a duplex Amp stream (see PtySession).
+ *
+ * Protocol (parent <-> worker), one JSON object per line:
+ *   parent -> worker: {"type":"exec","config":{...},"command":"...","timeout":N,"allowFallback":bool}
+ *   parent -> worker: {"type":"shell","config":{...},"timeout":N,"pty":{...}}
+ *   parent -> worker: {"type":"input","data":"..."}                     (plain text)
+ *   parent -> worker: {"type":"input","encoding":"base64","data_b64":"..."}   (binary-safe)
+ *   parent -> worker: {"type":"resize","cols":N,"rows":N}
+ *   parent -> worker: {"type":"close"}
+ *   worker -> parent: {"type":"chunk","stream":"stdout","data":"..."}
+ *   worker -> parent: {"type":"chunk","stream":"stdout","encoding":"base64","data_b64":"..."}
+ *   worker -> parent: {"type":"exit","code":0}
+ *   worker -> parent: {"type":"error","message":"..."}
  */
-final class SshStreamingRunner implements StreamingRunnerInterface
+final class SshStreamingRunner implements StreamingRunnerInterface, PtySessionRunnerInterface
 {
     public function __construct(
         private readonly string $phpBinary = PHP_BINARY,
@@ -63,6 +70,49 @@ final class SshStreamingRunner implements StreamingRunnerInterface
         ];
 
         return $this->runWorker($payload, $onChunk, $inputProvider);
+    }
+
+    public function openPtySession(
+        ServerConfig $config,
+        ?PtyConfig $pty = null,
+        ?Cancellation $cancellation = null,
+    ): PtySessionInterface {
+        if ($cancellation !== null) {
+            $cancellation->throwIfRequested();
+        }
+
+        $script = $this->workerScript
+            ?? dirname(__DIR__, 2) . '/src/Transport/Worker/streaming-worker.php';
+
+        $process = Process::start([$this->phpBinary, $script]);
+
+        $payload = [
+            'type' => 'shell',
+            'config' => $config->toArray(),
+            // 0 disables the worker-side idle timeout; interactive shells can
+            // stay open for the whole browser tab lifetime.
+            'timeout' => 0,
+            'pty' => ($pty ?? new PtyConfig())->toArray(),
+        ];
+
+        try {
+            $process->getStdin()->write(
+                json_encode($payload, JSON_THROW_ON_ERROR) . "\n"
+            );
+        } catch (\Throwable $e) {
+            try {
+                $process->kill();
+            } catch (\Throwable) {
+                // Ignore.
+            }
+            throw new WorkerException(
+                'Failed to send initial payload to PTY worker: ' . $e->getMessage(),
+                0,
+                $e,
+            );
+        }
+
+        return new PtySession($process);
     }
 
     /**
@@ -128,7 +178,8 @@ final class SshStreamingRunner implements StreamingRunnerInterface
                     }
                     $type = $msg['type'] ?? '';
                     if ($type === 'chunk') {
-                        $onChunk((string) ($msg['stream'] ?? 'stdout'), (string) ($msg['data'] ?? ''));
+                        $data = $this->decodeChunk($msg);
+                        $onChunk((string) ($msg['stream'] ?? 'stdout'), $data);
                     } elseif ($type === 'exit') {
                         $exitCode = (int) ($msg['code'] ?? 0);
                         break 2;
@@ -153,6 +204,19 @@ final class SshStreamingRunner implements StreamingRunnerInterface
         }
 
         return $exitCode;
+    }
+
+    /**
+     * @param array<string, mixed> $msg
+     */
+    private function decodeChunk(array $msg): string
+    {
+        if (($msg['encoding'] ?? '') === 'base64' && isset($msg['data_b64']) && is_string($msg['data_b64'])) {
+            $decoded = base64_decode($msg['data_b64'], true);
+            return $decoded !== false ? $decoded : '';
+        }
+
+        return (string) ($msg['data'] ?? '');
     }
 
     private function buildClosedStdoutMessage(string $stderrBuffer): string

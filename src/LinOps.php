@@ -25,11 +25,14 @@ use AfazTech\LinOps\Result\MemoryInfo;
 use AfazTech\LinOps\Result\NetworkAddressInfo;
 use AfazTech\LinOps\Result\ProcessInfo;
 use AfazTech\LinOps\Result\RouteInfo;
+use AfazTech\LinOps\Result\ServerTypeInfo;
 use AfazTech\LinOps\Result\ServiceRestartResult;
 use AfazTech\LinOps\Result\ServiceStatus;
 use AfazTech\LinOps\Result\SftpTransferResult;
 use AfazTech\LinOps\Service\ServiceInspector;
 use AfazTech\LinOps\Streaming\LocalStreamingRunner;
+use AfazTech\LinOps\Streaming\PtyConfig;
+use AfazTech\LinOps\Streaming\PtySessionInterface;
 use AfazTech\LinOps\Streaming\SshStreamingRunner;
 use AfazTech\LinOps\Streaming\StreamingRunnerInterface;
 use AfazTech\LinOps\System\HardwareInspector;
@@ -38,7 +41,9 @@ use AfazTech\LinOps\System\ProcessInspector;
 use AfazTech\LinOps\System\RebootManager;
 use AfazTech\LinOps\System\ResourceMonitor;
 use AfazTech\LinOps\System\SystemInspector;
+use AfazTech\LinOps\System\VirtualizationInspector;
 use AfazTech\LinOps\Transport\WorkerPoolTransport;
+use Amp\Cancellation;
 
 final class LinOps
 {
@@ -57,6 +62,7 @@ final class LinOps
     private readonly ProcessInspector $processInspector;
     private readonly LogInspector $logInspector;
     private readonly FirewallDetector $firewallDetector;
+    private readonly VirtualizationInspector $virtualizationInspector;
     private ?StreamingRunnerInterface $streamingRunner = null;
 
     public function __construct(
@@ -76,6 +82,7 @@ final class LinOps
         $this->processInspector = new ProcessInspector($this->executor);
         $this->logInspector = new LogInspector($this->executor, $this);
         $this->firewallDetector = new FirewallDetector($this->executor);
+        $this->virtualizationInspector = new VirtualizationInspector($this->executor);
     }
 
     // ─── System ────────────────────────────────────────────────────────────
@@ -225,6 +232,48 @@ final class LinOps
     public function getActiveFirewall(): ?FirewallInfo
     {
         return $this->firewallDetector->getActive($this->config);
+    }
+
+    // ─── Virtualization ────────────────────────────────────────────────────
+
+    /**
+     * Determine whether the server is a VPS (virtual machine) or a
+     * dedicated (bare-metal) host.
+     *
+     * Uses systemd-detect-virt, lscpu, /proc/cpuinfo, and DMI data. If any
+     * probe reports a VM signature, the server is classified as VPS. If
+     * systemd-detect-virt reports "none" and no other signal is present,
+     * the server is classified as DEDICATED. Otherwise UNKNOWN.
+     *
+     * The confidence field reflects signal strength:
+     *   1.0  - systemd-detect-virt reported a VM type
+     *   0.95 - lscpu "Hypervisor vendor" line present
+     *   0.9  - /proc/cpuinfo has the "hypervisor" flag
+     *   0.9  - sys_vendor matches a known VM vendor
+     *   0.85 - board/product matches a known VM signature
+     *   0.25 - only chassis_type = Other/Unknown (weak)
+     *   0.8  - DEDICATED (systemd-detect-virt = none, no signals)
+     *   0.0  - UNKNOWN (no data at all)
+     */
+    public function detectServerType(): ServerTypeInfo
+    {
+        return $this->virtualizationInspector->detect($this->config);
+    }
+
+    /**
+     * Convenience shortcut for detectServerType()->isVps().
+     */
+    public function isVps(): bool
+    {
+        return $this->detectServerType()->isVps();
+    }
+
+    /**
+     * Convenience shortcut for detectServerType()->isDedicated().
+     */
+    public function isDedicated(): bool
+    {
+        return $this->detectServerType()->isDedicated();
     }
 
     // ─── Processes & ports ─────────────────────────────────────────────────
@@ -429,6 +478,34 @@ final class LinOps
                 stream_set_blocking(STDIN, true);
             }
         }
+    }
+
+    /**
+     * Open a live PTY-backed interactive shell as a duplex Amp stream.
+     *
+     * Unlike openShell(), this returns immediately with a session object
+     * that can be read and written from independent fibers — suitable for
+     * a web terminal with multiple concurrent tabs.
+     *
+     * Not available in local mode: the local shell runner does not allocate
+     * a real PTY, so resize() and interactive full-screen programs would
+     * not work. Use SSH mode for interactive terminals.
+     */
+    public function openPtySession(
+        ?PtyConfig $pty = null,
+        ?Cancellation $cancellation = null,
+    ): PtySessionInterface {
+        if ($this->config->isLocal()) {
+            throw new LinOpsException(
+                'PTY sessions are not supported in local mode; use SSH.'
+            );
+        }
+
+        return (new SshStreamingRunner())->openPtySession(
+            $this->config,
+            $pty,
+            $cancellation,
+        );
     }
 
     // ─── Local mode helpers ────────────────────────────────────────────────
