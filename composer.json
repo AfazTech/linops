@@ -1,6 +1,6 @@
 {
     "name": "afaztech/linops",
-    "description": "Production-ready asynchronous PHP library for Linux server management over SSH",
+    "description": "asynchronous PHP library for Linux server management over SSH",
     "type": "library",
     "license": "MIT",
     "keywords": ["linux", "ssh", "async", "amp", "server-management", "monitoring"],
