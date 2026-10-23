@@ -12,22 +12,14 @@ use Amp\Process\Process;
 /**
  * Amp-native PTY session backed by a streaming-worker.php subprocess.
  *
- * The worker speaks a newline-delimited JSON protocol over stdio. This class
- * exposes that protocol as a duplex Amp stream so callers can consume output
- * and send input from independent fibers without ever blocking each other.
- *
- * Worker -> parent messages:
- *   {"type":"chunk","stream":"stdout","data":"..."}           (UTF-8 safe)
- *   {"type":"chunk","stream":"stdout","encoding":"base64","data_b64":"..."}
- *   {"type":"exit","code":0}
- *   {"type":"error","message":"..."}
- *
- * Parent -> worker messages:
- *   {"type":"input","encoding":"base64","data_b64":"..."}
- *   {"type":"resize","cols":80,"rows":24}
- *   {"type":"close"}
+ * Implements IteratorAggregate explicitly because PtySessionInterface
+ * extends Amp's ReadableStream/WritableStream, which reach Traversable.
+ * PHP requires a concrete class to name Iterator or IteratorAggregate
+ * in its implements list; otherwise loading the class fatals with
+ * "must implement interface Traversable as part of either Iterator or
+ * IteratorAggregate".
  */
-final class PtySession implements PtySessionInterface
+final class PtySession implements \IteratorAggregate, PtySessionInterface
 {
     private ?int $exitCode = null;
     private bool $closed = false;
